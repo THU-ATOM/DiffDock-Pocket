@@ -701,7 +701,8 @@ def get_fullrec_graph(rec, rec_coords, c_alpha_coords, n_coords, c_coords, misc_
     src_c_alpha_idx = np.concatenate([np.asarray([i] * len(l)) for i, l in enumerate(rec_coords)])
     atom_feat = torch.from_numpy(np.asarray(rec_atom_featurizer(rec)))
     atom_coords = torch.from_numpy(np.concatenate(rec_coords, axis=0)).float()
-    if misc_coords is not None and len(misc_coords > 0):
+    # misc_coords may be None or an array of misc atom coordinates; ensure correct length check
+    if misc_coords is not None and len(misc_coords) > 0:
         misc_calpha_dist = spatial.distance.cdist(misc_coords, c_alpha_coords)
         closest_c_alpha_idx = np.argmin(misc_calpha_dist, axis=1)
         src_c_alpha_idx = np.concatenate([src_c_alpha_idx, closest_c_alpha_idx])

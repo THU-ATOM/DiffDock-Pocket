@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
+import tempfile
 
 MIN_EPS, MAX_EPS, N_EPS = 0.01, 2, 1000
 X_N = 2000
@@ -37,12 +38,40 @@ def _score(exp, omega, eps, L=2000):  # score of density over SO(3)
         dSigma += (2 * l + 1) * np.exp(-l * (l + 1) * eps**2) * (lo * dhi - hi * dlo) / lo ** 2
     return dSigma / exp
 
+current_file_path = os.path.abspath(__file__)
+_source_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-if os.path.exists('.so3_omegas_array2.npy'):
-    _omegas_array = np.load('.so3_omegas_array2.npy')
-    _cdf_vals = np.load('.so3_cdf_vals2.npy')
-    _score_norms = np.load('.so3_score_norms2.npy')
-    _exp_score_norms = np.load('.so3_exp_score_norms2.npy')
+_env_run_dir = os.environ.get('SO3_CACHE_DIR')
+if _env_run_dir:
+    cache_dir = os.path.abspath(_env_run_dir)
+else:
+    cache_dir = _source_dir
+
+def _save_with_fallback(path, arr):
+    """Try to save `arr` to `path`. On permission error, save to tmp dir instead and
+    return the actual path used."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.save(path, arr)
+        return path
+    except PermissionError:
+        tmp = tempfile.gettempdir()
+        alt = os.path.join(tmp, os.path.basename(path))
+        print(f"权限错误: 无法写入 {path}，退回到临时目录 {alt}")
+        np.save(alt, arr)
+        return alt
+
+
+_omegas_path = os.path.join(cache_dir, '.so3_omegas_array2.npy')
+_cdf_path = os.path.join(cache_dir, '.so3_cdf_vals2.npy')
+_score_norms_path = os.path.join(cache_dir, '.so3_score_norms2.npy')
+_exp_score_norms_path = os.path.join(cache_dir, '.so3_exp_score_norms2.npy')
+
+if os.path.exists(_omegas_path):
+    _omegas_array = np.load(_omegas_path)
+    _cdf_vals = np.load(_cdf_path)
+    _score_norms = np.load(_score_norms_path)
+    _exp_score_norms = np.load(_exp_score_norms_path)
 else:
     _eps_array = 10 ** np.linspace(np.log10(MIN_EPS), np.log10(MAX_EPS), N_EPS)
     _omegas_array = np.linspace(0, np.pi, X_N + 1)[1:]
@@ -54,11 +83,11 @@ else:
 
     _exp_score_norms = np.sqrt(np.sum(_score_norms**2 * _pdf_vals, axis=1) / np.sum(_pdf_vals, axis=1) / np.pi)
 
-    np.save('.so3_omegas_array2.npy', _omegas_array)
-    np.save('.so3_cdf_vals2.npy', _cdf_vals)
-    np.save('.so3_score_norms2.npy', _score_norms)
-    np.save('.so3_exp_score_norms2.npy', _exp_score_norms)
-
+    # save with fallback if the configured cache_dir isn't writable
+    _save_with_fallback(_omegas_path, _omegas_array)
+    _save_with_fallback(_cdf_path, _cdf_vals)
+    _save_with_fallback(_score_norms_path, _score_norms)
+    _save_with_fallback(_exp_score_norms_path, _exp_score_norms)
 
 def sample(eps):
     eps_idx = (np.log10(eps) - np.log10(MIN_EPS)) / (np.log10(MAX_EPS) - np.log10(MIN_EPS)) * N_EPS

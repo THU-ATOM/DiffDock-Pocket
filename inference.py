@@ -34,6 +34,7 @@ from utils.download import download_and_extract
 from utils.posebusters_em import optimize_ligand_in_pocket
 from pathlib import Path
 from openmm.unit import megajoule, mole
+import pickle
 
 
 if os.name != 'nt':  # The line does not work on Windows
@@ -51,6 +52,7 @@ def _get_parser():
     parser.add_argument('--config', type=FileType(mode='r'), default=None)
     parser.add_argument('--complex_name', type=str, default='unnamed_complex', help='Name that the complex will be saved with')
     parser.add_argument('--protein_ligand_csv', type=str, default=None, help='Path to a .csv file specifying the input as described in the README. If this is not None, it will be used instead of the --protein_path and --ligand parameters')
+    parser.add_argument('--protein_ligand_airdd_input', type=str, default=None, help='Path to a input file specifying the input as described in the AIRDD benchmark docking template.')
     parser.add_argument('--protein_path', '--experimental_protein', type=str, default=None, help='Path to the protein .pdb file')
 
     parser.add_argument('--ligand', type=str, default='COc(cc1)ccc1C#N', help='Either a SMILES string or the path to a molecule file that rdkit can read')
@@ -133,12 +135,14 @@ def infer_single_complex(idx: int, protein_ligand_info_row: Mapping, model: torc
     data_list = []
     try:
         data_list = [copy.deepcopy(orig_complex_graph) for _ in range(spc)]
-        write_dir = f'{args.out_dir}/index{idx}___{complex_name.replace("/", "-")}'
+        write_dir = f'{args.out_dir}/{complex_name.replace("/", "-")}'
         if os.path.exists(write_dir) and args.skip_existing:
             return 0
 
-        randomize_position(data_list, score_model_args.no_torsion, args.no_random, score_model_args.tr_sigma_max,
-                           flexible_sidechains=False if args.rigid else score_model_args.flexible_sidechains)
+        if not args.protein_ligand_airdd_input is not None:
+            # For AIRDD input, we always want to use the processed input structures
+            randomize_position(data_list, score_model_args.no_torsion, args.no_random, score_model_args.tr_sigma_max,
+                            flexible_sidechains=False if args.rigid else score_model_args.flexible_sidechains)
 
         pdb = None
         lig = orig_complex_graph.mol
@@ -317,7 +321,7 @@ def main(args):
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    if args.model_dir is None or args.filtering_dir is None:
+    if args.model_dir is None or args.filtering_model_dir is None:
         base_model_dir = os.path.join(args.model_cache_dir, args.tag)
         os.makedirs(base_model_dir, exist_ok=True)
 
@@ -337,6 +341,9 @@ def main(args):
 
     if args.protein_ligand_csv is not None:
         protein_ligand_df = load_protein_ligand_df(args.protein_ligand_csv, strict=False)
+    elif args.protein_ligand_airdd_input is not None:
+        with open(args.protein_ligand_airdd_input, 'rb') as f:
+            protein_ligand_df = pickle.load(f)
     elif args.protein_path is not None:
         # Turn single entries into a one-row dataframe
         df = pd.DataFrame({'complex_name': [args.complex_name],
@@ -390,7 +397,8 @@ def main(args):
                                fixed_knn_radius_graph=not score_model_args.not_fixed_knn_radius_graph,
                                knn_only_graph=not score_model_args.not_knn_only_graph,
                                include_miscellaneous_atoms=score_model_args.include_miscellaneous_atoms,
-                               use_old_wrong_embedding_order=score_model_args.use_old_wrong_embedding_order)
+                               use_old_wrong_embedding_order=score_model_args.use_old_wrong_embedding_order,
+                               is_airdd_preprocessing=args.protein_ligand_airdd_input is not None)
         # test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False)
 
         filtering_test_dataset = filtering_complex_dict = None
@@ -425,7 +433,8 @@ def main(args):
                                                  fixed_knn_radius_graph=not filtering_args.not_fixed_knn_radius_graph,
                                                  knn_only_graph=not filtering_args.not_knn_only_graph,
                                                  include_miscellaneous_atoms=filtering_args.include_miscellaneous_atoms,
-                                                 use_old_wrong_embedding_order=filtering_args.use_old_wrong_embedding_order)
+                                                 use_old_wrong_embedding_order=filtering_args.use_old_wrong_embedding_order,
+                                                 is_airdd_preprocessing=args.protein_ligand_airdd_input is not None)
                 filtering_complex_dict = {d.name: d for d in filtering_test_dataset}
 
     t_to_sigma = partial(t_to_sigma_compl, args=score_model_args)

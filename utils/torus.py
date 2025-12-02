@@ -1,6 +1,7 @@
 import numpy as np
 import tqdm
 import os
+import tempfile
 
 """
     Preprocessing for the SO(2)/torus sampling and score computations, truncated infinite series are computed and then
@@ -28,16 +29,41 @@ SIGMA_MIN, SIGMA_MAX, SIGMA_N = 3e-3, 2, 5000  # relative to pi
 x = 10 ** np.linspace(np.log10(X_MIN), 0, X_N + 1) * np.pi
 sigma = 10 ** np.linspace(np.log10(SIGMA_MIN), np.log10(SIGMA_MAX), SIGMA_N + 1) * np.pi
 
-if os.path.exists('.p.npy'):
-    p_ = np.load('.p.npy')
-    score_ = np.load('.score.npy')
+current_file_path = os.path.abspath(__file__)
+_source_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+_env_run_dir = os.environ.get('SO3_CACHE_DIR')
+if _env_run_dir:
+    cache_dir = os.path.abspath(_env_run_dir)
+else:
+    cache_dir = _source_dir
+
+def _save_with_fallback(path, arr):
+    """Try to save `arr` to `path`. On permission error, save to tmp dir instead and
+    return the actual path used."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.save(path, arr)
+        return path
+    except PermissionError:
+        tmp = tempfile.gettempdir()
+        alt = os.path.join(tmp, os.path.basename(path))
+        print(f"权限错误: 无法写入 {path}，退回到临时目录 {alt}")
+        np.save(alt, arr)
+        return alt
+
+_p_path = os.path.join(cache_dir, '.p.npy')
+_score_path = os.path.join(cache_dir, '.score.npy')
+
+if os.path.exists(_p_path):
+    p_ = np.load(_p_path)
+    score_ = np.load(_score_path)
 else:
     p_ = p(x, sigma[:, None], N=100)
-    np.save('.p.npy', p_)
+    _save_with_fallback(_p_path, p_)
 
     score_ = grad(x, sigma[:, None], N=100) / p_
-    np.save('.score.npy', score_)
-
+    _save_with_fallback(_score_path, score_)
 
 def score(x, sigma):
     x = (x + np.pi) % (2 * np.pi) - np.pi

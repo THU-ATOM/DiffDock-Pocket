@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 from datasets.process_mols import read_molecule, get_rec_graph, \
     get_lig_graph_with_matching, extract_receptor_structure, parse_receptor_structure, parse_pdb_from_path, \
-    generate_conformer, get_sidechain_rotation_masks, set_sidechain_rotation_masks, count_pdb_warnings
+    generate_conformer, get_sidechain_rotation_masks, set_sidechain_rotation_masks, count_pdb_warnings, RemoveHs
 from datasets.sidechain_conformer_matching import optimize_rotatable_bonds, RMSD
 from utils.diffusion_utils import modify_conformer, get_inverse_schedule, set_time, modify_sidechains
 from utils.utils import read_strings_from_txt, get_available_devices, \
@@ -145,7 +145,7 @@ class PDBBind(Dataset):
                  pocket_reduction_mode='center-dist',
                  flexible_sidechains=False, flexdist=3.5,flexdist_distance_metric = "L2",
                  knn_only_graph=False, fixed_knn_radius_graph=False, include_miscellaneous_atoms=False, use_old_wrong_embedding_order=False,
-                 cross_docking_testset = False):
+                 cross_docking_testset = False, is_airdd_preprocessing = False,):
 
         super(PDBBind, self).__init__(root=None, transform=transform)
 
@@ -200,6 +200,7 @@ class PDBBind(Dataset):
         self.flexdist_distance_metric = flexdist_distance_metric
         self.all_atoms = all_atoms
         self.cross_docking_testset = cross_docking_testset
+        self.is_airdd_preprocessing = is_airdd_preprocessing
 
         if self.compare_true_protein and self.use_original_conformer_fallback:
             raise NotImplementedError("compare_true_protein and use_original_conformer_fallback cannot be used together")
@@ -262,7 +263,12 @@ class PDBBind(Dataset):
                 self.protein_ligand_df.reset_index(inplace=True, drop=True)
                 logging.info(f"Kept {self.protein_ligand_df.shape[0]} rows after filtering by {self.split_path}")
 
-            self.preprocessing()
+            if self.is_airdd_preprocessing:
+                # For airdd preprocessing, we assume the dataframe is already preprocessed
+                device = get_available_devices(self.num_workers)[0] if self.num_workers > 0 else None
+                self.airdd_preprocessing(device=device)
+            else:
+                self.preprocessing()
 
         logging.info('Loading data from memory: ', self.full_cache_file_path)
         with open(self.full_cache_file_path, 'rb') as f:
@@ -388,14 +394,30 @@ class PDBBind(Dataset):
 
     @property
     def ligand_path_list(self):
-        return self.protein_ligand_df["ligand_path"].to_list()
+        if self.is_airdd_preprocessing:
+            # `ligand_sdf_list` typically contains a list of sdf paths for each row.
+            # Return the first path for each row, safely handling empty/None/NaN values.
+            def _first(x):
+                if isinstance(x, (list, tuple, np.ndarray)):
+                    return x[0] if len(x) > 0 else None
+                if pd.isna(x):
+                    return None
+                return x
+
+            return [_first(x) for x in self.protein_ligand_df["ligand_sdf_list"].tolist()]
+        else:
+            return self.protein_ligand_df["ligand_path"].to_list()
 
     def _get_complex_from_row(self, ind, row, lm_embedding_chains):
-        cur_graph, cur_ligand = self.get_complex(row["experimental_protein"], lm_embedding_chains,
-                                                 row["mol"], row["ligand_path"],
-                                                 lig_center=row["pocket_center"],
-                                                 predefined_flexible_sidechains=row.get("flexible_sidechains", None),
-                                                 comp_protein_path=row.get("computational_protein", None))
+        if not self.is_airdd_preprocessing:
+            cur_graph, cur_ligand = self.get_complex(row["experimental_protein"], lm_embedding_chains,
+                                                    row["mol"], row["ligand_path"],
+                                                    lig_center=row["pocket_center"],
+                                                    predefined_flexible_sidechains=row.get("flexible_sidechains", None),
+                                                    comp_protein_path=row.get("computational_protein", None))
+        else:
+            cur_graph, cur_ligand = self.airdd_get_complex(row["experimental_protein"], lm_embedding_chains,
+                                                    row["mol"], row["ligand_sdf_list"], row["pocket_atom_info_list"], row["min"], row["max"])
         return {"ind": ind, "complex_graph": cur_graph, "rdkit_ligand": cur_ligand}
 
     def process_dataframe_piece(self, df, device=None) -> List[str]:
@@ -720,11 +742,12 @@ class PDBBind(Dataset):
         if self.compare_true_protein:
             complex_graph["flexResidues"].true_sc_pos -= protein_center
 
-        if (not self.matching) or self.num_conformers == 1:
-            complex_graph['ligand'].pos -= protein_center
-        else:
-            for p in complex_graph['ligand'].pos:
-                p -= protein_center
+        if not self.is_airdd_preprocessing:
+            if (not self.matching) or self.num_conformers == 1:
+                complex_graph['ligand'].pos -= protein_center
+            else:
+                for p in complex_graph['ligand'].pos:
+                    p -= protein_center
 
         complex_graph.original_center = protein_center
 
@@ -755,6 +778,215 @@ class PDBBind(Dataset):
         else:
             io.save(out)
 
+    def airdd_preprocessing(self, device=None):
+        self.protein_ligand_df["mol"] = None
+        for ind, row in tqdm(self.protein_ligand_df.iterrows()):
+            ligand_sdf_list = row["ligand_sdf_list"]
+            mol = read_molecule(ligand_sdf_list[0], remove_hs=False)
+            self.protein_ligand_df.at[ind, "mol"] = mol
+
+        self.protein_ligand_df["complex_graph"] = None
+        self.protein_ligand_df["rdkit_ligand"] = None
+
+        counter = 0
+        for ind, row in tqdm(self.protein_ligand_df.iterrows()):
+            complex_paths = self.airdd_process_dataframe_piece(self.protein_ligand_df, device)
+
+        for complex_path in complex_paths:
+            result = pickle.load(open(complex_path, 'rb'))
+            ind, cur_graph, cur_ligand = result["ind"], result["complex_graph"], result["rdkit_ligand"]
+            if cur_graph and cur_ligand:
+                cur_graph.mol = cur_ligand
+                counter += 1
+
+                self.protein_ligand_df.at[ind, "complex_graph"] = cur_graph
+                self.protein_ligand_df.at[ind, "rdkit_ligand"] = cur_ligand
+
+        num_expected = len(self)
+        keep_rows = self.protein_ligand_df["complex_graph"].notna() & self.protein_ligand_df["rdkit_ligand"].notna()
+        self.protein_ligand_df = self.protein_ligand_df[keep_rows.values]
+        print(f"Saving {self.protein_ligand_df.shape[0]} / {num_expected} processed complexes & ligands to cache")
+
+        with open(self.full_cache_file_path, 'wb') as f:
+            pickle.dump(self.protein_ligand_df, f)
+
+    def airdd_process_dataframe_piece(self, df, device) -> List[str]:
+        print(f"Computing ESM embeddings for {len(df)} proteins...")
+        esm_embeddings = esm_utils.esm_embeddings_from_complexes(df["complex_name"],
+                                                                 df["experimental_protein"],
+                                                                 device=device)
+        complex_paths = []
+        rn = 0
+        with tqdm(total=len(df), desc='Loading complexes') as pbar:
+            for ind, row in df.iterrows():
+                complex_path = self.complex_cache_file_path(ind, row["complex_name"])
+                if not os.path.exists(complex_path):
+                    result = self._get_complex_from_row(ind, row, esm_embeddings[rn])
+                    with open(complex_path, 'wb') as f:
+                        pickle.dump(result, f)
+
+                complex_paths.append(complex_path)
+                rn += 1
+                pbar.update()
+        return complex_paths
+
+    def airdd_get_complex(self, exp_protein_path: str, lm_embedding_chains: List, ligand: Mol, ligand_sdf_list: List[str],
+                    pocket_atom_info_list: List, flex_coord_min: List, flex_coord_max: List):
+        if not os.path.exists(exp_protein_path):
+            raise ValueError(f"File {exp_protein_path} does not exist")
+        
+        try:
+            ligand_path = ligand_sdf_list[0]
+            experimental_receptor = parse_pdb_from_path(exp_protein_path)
+            complex_name = f'{os.path.basename(exp_protein_path)}___{os.path.basename(ligand_path)}'
+            lig = ligand
+
+            def _sort_atoms_by_element(_protein):
+                for res in _protein.get_residues():
+                    res.child_list.sort(key=lambda atom: PDBBind.order_atoms_in_residue(res, atom))
+
+            def _remove_hs(_protein):
+                for res in _protein.get_residues():
+                    atoms_to_remove = []
+                    for atom in res:
+                        if atom.element == 'H':
+                            atoms_to_remove.append(atom)
+                    for atom in atoms_to_remove:
+                        res.detach_child(atom.id)
+
+            remove_hs_and_sort = self.conformer_match_sidechains or self.compare_true_protein or self.flexible_sidechains
+            if remove_hs_and_sort:
+                _remove_hs(experimental_receptor)
+                _sort_atoms_by_element(experimental_receptor)
+
+        except Exception as e:
+            print(f'Skipping {exp_protein_path} because of the error:')
+            print(e)
+            print(traceback.format_exc())
+            return None, None
+
+        if self.max_lig_size is not None and lig.GetNumHeavyAtoms() > self.max_lig_size:
+            print(f'Ligand with {lig.GetNumHeavyAtoms()} heavy atoms is larger than max_lig_size {self.max_lig_size}. '
+                  f'Not including {exp_protein_path} in preprocessed data.')
+            return None, None
+
+        try:
+            complex_graph = HeteroData()
+            complex_graph['name'] = complex_name
+            # add conformers from ligand_sdf_list to ligand graph
+            get_lig_graph_with_matching(lig, complex_graph, self.popsize, self.maxiter, self.matching,
+                                        self.keep_original, self.num_conformers, remove_hs=self.remove_hs)
+                
+            pocket_model = experimental_receptor
+
+            assert pocket_model is not None, "No pocket model found"
+            rec_atoms_for_pocket = torch.tensor(
+                np.array([a.coord for a in pocket_model.get_atoms() if a.name == 'CA']),
+                dtype=complex_graph['ligand'].pos[0].dtype) # TODO: what for?
+
+            # define pocket using pocket_atom_info_list
+            receptor = experimental_receptor
+            pocket_residues = set()
+            for atom_info in pocket_atom_info_list:
+                if atom_info['is_pocket']:
+                    pocket_residues.add( (atom_info['chain_id'], atom_info['residue_id']))
+            invalid_chain_ids = []
+            discarded_res_ids = {}
+            valid_lm_embeddings = []
+            rec_coords = np.array([])
+            c_alpha_coords = np.array([])
+            n_coords = np.array([])
+            c_coords = np.array([])
+            for i, chain in enumerate(receptor):
+                discarded_res_ids[chain] = []
+                # enumerate to keep track of the residue index (used for LM embedding masking)
+                for res_idx, residue in enumerate(chain):
+                    # skip waters
+                    if residue.get_resname() == 'HOH':
+                        discarded_res_ids[chain].append((res_idx, residue.get_id()))
+                        continue
+                    # skip residues that are not part of the pocket
+                    if (chain.id, residue.id) not in pocket_residues:
+                        discarded_res_ids[chain].append((res_idx, residue.get_id()))
+                        continue
+                    residue_coords = []
+                    for atom in residue:
+                        if atom.name[0] == 'H':
+                            continue
+                        residue_coords.append(list(atom.get_vector()))
+                        if atom.name == 'CA':
+                            c_alpha = list(atom.get_vector())
+                        if atom.name == 'N':
+                            n = list(atom.get_vector())
+                        if atom.name == 'C':
+                            c = list(atom.get_vector())
+                    if c_alpha != None and n != None and c != None:
+                        c_alpha_coords = np.vstack([c_alpha_coords, c_alpha]) if len(c_alpha_coords) else np.array([c_alpha])
+                        n_coords = np.vstack([n_coords, n]) if len(n_coords) else np.array([n])
+                        c_coords = np.vstack([c_coords, c]) if len(c_coords) else np.array([c])
+                        rec_coords = np.vstack([rec_coords, residue_coords]) if len(rec_coords) else np.array(residue_coords)
+                mask = torch.ones(len(lm_embedding_chains[i]), dtype=torch.bool, device=lm_embedding_chains[i].device)
+                mask[[d[0] for d in discarded_res_ids[chain]]] = 0
+                valid_lm_embeddings.append(lm_embedding_chains[i][mask].detach().cpu())
+                for _, res_id in discarded_res_ids[chain]:
+                    chain.detach_child(res_id)
+                if len(chain) == 0:
+                    invalid_chain_ids.append(chain.id)
+            for chain_id in invalid_chain_ids:
+                receptor.detach_child(chain_id)
+
+            check_rec_coords = np.array([atom_info['coords'] for atom_info in pocket_atom_info_list if atom_info['is_pocket'] and atom_info['atom_name'][0] != 'H'])
+            check_c_alpha_coords = np.array([atom_info['coords'] for atom_info in pocket_atom_info_list if atom_info['is_pocket'] and atom_info['atom_name'] == 'CA'])
+            check_n_coords = np.array([atom_info['coords'] for atom_info in pocket_atom_info_list if atom_info['is_pocket'] and atom_info['atom_name'] == 'N'])
+            check_c_coords = np.array([atom_info['coords'] for atom_info in pocket_atom_info_list if atom_info['is_pocket'] and atom_info['atom_name'] == 'C'])
+            assert len(rec_coords) == len(check_rec_coords),f"Mismatch in receptor coords. {len(rec_coords)} vs {len(check_rec_coords)}"
+            assert len(c_alpha_coords) == len(check_c_alpha_coords),f"Mismatch in c_alpha coords. {len(c_alpha_coords)} vs {len(check_c_alpha_coords)}"
+            assert len(n_coords) == len(check_n_coords),f"Mismatch in n coords. {len(n_coords)} vs {len(check_n_coords)}"
+            assert len(c_coords) == len(check_c_coords),f"Mismatch in c coords. {len(c_coords)} vs {len(check_c_coords)}"
+            misc_coords, misc_features = None, None  # TODO: handle misc coords and features if needed
+            lm_embeddings = np.concatenate(valid_lm_embeddings, axis=0)
+
+            if lm_embeddings is not None and len(c_alpha_coords) != len(lm_embeddings):
+                raise ValueError(f'LM embeddings for complex {exp_protein_path} did not have the right length for the protein.')
+
+            if not self.knn_only_graph or not self.fixed_knn_radius_graph:
+                raise NotImplementedError('Backwards compatibility has been dropped. We only support knn_only_graph=True and fixed_knn_radius_graph=True.')
+
+            get_rec_graph(receptor, [rec_coords], c_alpha_coords, n_coords, c_coords, misc_coords, misc_features,
+                          complex_graph,
+                          rec_radius=self.receptor_radius,
+                          c_alpha_max_neighbors=self.c_alpha_max_neighbors, all_atoms=self.all_atoms,
+                          remove_hs=self.remove_hs, lm_embeddings=lm_embeddings)
+
+            # select flexible sidechains in receptor
+            if self.flexible_sidechains:
+                logging.debug(f"Computing flexible residues within radius {self.flexdist} of binding pocket using {self.flexdist_distance_metric} distance metric")
+
+                xMin, yMin, zMin = flex_coord_min
+                xMax, yMax, zMax = flex_coord_max
+
+                def airdd_prism_distance_metric(atom:Bio.PDB.Atom.Atom):
+                    atom_coord = torch.tensor(atom.coord)
+                    if (xMin <= atom_coord[0] <= xMax) * (yMin <= atom_coord[1] <= yMax) * (zMin <= atom_coord[2] <= zMax):
+                        # check distance to ligand atoms akin to gnina, valid as hydrogens are removed during graph construction
+                        return True
+                    else: 
+                        return False 
+
+                accept_atom_function = airdd_prism_distance_metric
+                
+                complex_graph = set_sidechain_rotation_masks(complex_graph, receptor, accept_atom_function, remove_hs=self.remove_hs)
+
+        except Exception as e:
+            print(f'Skipping {exp_protein_path} because of the error: {e}')
+            if not isinstance(e, ProcessingException):
+                print(traceback.format_exc())
+            return None, None
+
+        protein_center = torch.mean(complex_graph['receptor'].pos, dim=0, keepdim=True)
+        complex_graph = self.center_complex(complex_graph, protein_center)
+
+        return complex_graph, lig
 
 class ProcessingException(Exception):
     def __init__(self, message):
