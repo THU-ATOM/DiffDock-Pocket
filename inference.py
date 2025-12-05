@@ -35,7 +35,9 @@ from utils.posebusters_em import optimize_ligand_in_pocket
 from pathlib import Path
 from openmm.unit import megajoule, mole
 import pickle
-
+from io import BytesIO
+from zipfile import ZipFile
+from urllib.request import urlopen
 
 if os.name != 'nt':  # The line does not work on Windows
     import resource
@@ -332,6 +334,26 @@ def main(args):
         if args.filtering_model_dir is None:
             logging.debug(f'--filtering_model_dir is not set. Using tag: {args.tag}')
             args.filtering_model_dir = download_and_extract(f'{REPOSITORY_URL}/releases/download/{args.tag}/confidence_model.zip', base_model_dir, 'confidence_model')
+
+    if not os.path.exists(f'{args.model_dir}/model_parameters.yml') or not os.path.exists(f'{args.filtering_model_dir}/model_parameters.yml'):
+        checkpointdir = os.path.dirname(args.model_dir)
+        print("DEBUG: check pointdir", checkpointdir, os.path.exists(checkpointdir))
+        """ensure checkpoint exist or download from github releases"""
+        tag = "v1.0.0"
+        base_url = f"https://github.com/plainerman/DiffDock-Pocket/releases/download/{tag}"
+        # If checkpoint for score model and confidence model already exists, assume checkpoint is present
+        model_names = ["score_model", "confidence_model"]
+        subfolders = [name for name in os.listdir(checkpointdir) if os.path.isdir(os.path.join(checkpointdir, name))]
+        existing_folders = [folder for folder in model_names if folder in subfolders]
+        for model_name in model_names:
+            if not model_name in existing_folders:
+                url = f"{base_url}/{model_name}.zip"
+                dst = checkpointdir
+                resp = urlopen(url)
+                with ZipFile(BytesIO(resp.read())) as zip_file:
+                    os.mkdir(os.path.join(dst, model_name))
+                    zip_file.extractall(dst)
+                assert os.path.exists(dst), f'{dst} was not present in downloaded file {url}'
 
     with open(f'{args.model_dir}/model_parameters.yml') as f:
         score_model_args = Namespace(**yaml.full_load(f))
