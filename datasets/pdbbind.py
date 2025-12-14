@@ -270,7 +270,7 @@ class PDBBind(Dataset):
             else:
                 self.preprocessing()
 
-        logging.info('Loading data from memory: ', self.full_cache_file_path)
+        print('Loading data from memory: ', self.full_cache_file_path)
         with open(self.full_cache_file_path, 'rb') as f:
             self.protein_ligand_df = pickle.load(f)
 
@@ -390,6 +390,8 @@ class PDBBind(Dataset):
 
     @property
     def protein_path_list(self):
+        if self.is_airdd_preprocessing:
+            return self.protein_ligand_df["source_pdb"].to_list()
         return self.protein_ligand_df["experimental_protein"].to_list()
 
     @property
@@ -416,8 +418,8 @@ class PDBBind(Dataset):
                                                     predefined_flexible_sidechains=row.get("flexible_sidechains", None),
                                                     comp_protein_path=row.get("computational_protein", None))
         else:
-            cur_graph, cur_ligand = self.airdd_get_complex(row["experimental_protein"], lm_embedding_chains,
-                                                    row["mol"], row["ligand_sdf_list"], row["pocket_atom_info_list"], row["min"], row["max"])
+            cur_graph, cur_ligand = self.airdd_get_complex(row["source_pdb"], lm_embedding_chains,
+                                                    row["mol"], row["ligand_sdf_list"], row["pocket_atom_info_list"])
         return {"ind": ind, "complex_graph": cur_graph, "rdkit_ligand": cur_ligand}
 
     def process_dataframe_piece(self, df, device=None) -> List[str]:
@@ -789,8 +791,7 @@ class PDBBind(Dataset):
         self.protein_ligand_df["rdkit_ligand"] = None
 
         counter = 0
-        for ind, row in tqdm(self.protein_ligand_df.iterrows()):
-            complex_paths = self.airdd_process_dataframe_piece(self.protein_ligand_df, device)
+        complex_paths = self.airdd_process_dataframe_piece(self.protein_ligand_df, device)
 
         for complex_path in complex_paths:
             result = pickle.load(open(complex_path, 'rb'))
@@ -813,7 +814,7 @@ class PDBBind(Dataset):
     def airdd_process_dataframe_piece(self, df, device) -> List[str]:
         print(f"Computing ESM embeddings for {len(df)} proteins...")
         esm_embeddings = esm_utils.esm_embeddings_from_complexes(df["complex_name"],
-                                                                 df["experimental_protein"],
+                                                                 df["source_pdb"],
                                                                  device=device)
         complex_paths = []
         rn = 0
@@ -830,15 +831,15 @@ class PDBBind(Dataset):
                 pbar.update()
         return complex_paths
 
-    def airdd_get_complex(self, exp_protein_path: str, lm_embedding_chains: List, ligand: Mol, ligand_sdf_list: List[str],
-                    pocket_atom_info_list: List, flex_coord_min: List, flex_coord_max: List):
-        if not os.path.exists(exp_protein_path):
-            raise ValueError(f"File {exp_protein_path} does not exist")
+    def airdd_get_complex(self, source_pdb: str, lm_embedding_chains: List, ligand: Mol, ligand_sdf_list: List[str],
+                    pocket_atom_info_list: List):
+        if not os.path.exists(source_pdb):
+            raise ValueError(f"File {source_pdb} does not exist")
         
         try:
             ligand_path = ligand_sdf_list[0]
-            experimental_receptor = parse_pdb_from_path(exp_protein_path)
-            complex_name = f'{os.path.basename(exp_protein_path)}___{os.path.basename(ligand_path)}'
+            experimental_receptor = parse_pdb_from_path(source_pdb)
+            complex_name = f'{os.path.basename(source_pdb)}___{os.path.basename(ligand_path)}'
             lig = ligand
 
             def _sort_atoms_by_element(_protein):
@@ -860,14 +861,14 @@ class PDBBind(Dataset):
                 _sort_atoms_by_element(experimental_receptor)
 
         except Exception as e:
-            print(f'Skipping {exp_protein_path} because of the error:')
+            print(f'Skipping {source_pdb} because of the error:')
             print(e)
             print(traceback.format_exc())
             return None, None
 
         if self.max_lig_size is not None and lig.GetNumHeavyAtoms() > self.max_lig_size:
             print(f'Ligand with {lig.GetNumHeavyAtoms()} heavy atoms is larger than max_lig_size {self.max_lig_size}. '
-                  f'Not including {exp_protein_path} in preprocessed data.')
+                  f'Not including {source_pdb} in preprocessed data.')
             return None, None
 
         try:
@@ -893,7 +894,7 @@ class PDBBind(Dataset):
             invalid_chain_ids = []
             discarded_res_ids = {}
             valid_lm_embeddings = []
-            rec_coords = np.array([])
+            rec_coords = []
             c_alpha_coords = np.array([])
             n_coords = np.array([])
             c_coords = np.array([])
@@ -924,7 +925,7 @@ class PDBBind(Dataset):
                         c_alpha_coords = np.vstack([c_alpha_coords, c_alpha]) if len(c_alpha_coords) else np.array([c_alpha])
                         n_coords = np.vstack([n_coords, n]) if len(n_coords) else np.array([n])
                         c_coords = np.vstack([c_coords, c]) if len(c_coords) else np.array([c])
-                        rec_coords = np.vstack([rec_coords, residue_coords]) if len(rec_coords) else np.array(residue_coords)
+                        rec_coords.append(np.array(residue_coords))
                 mask = torch.ones(len(lm_embedding_chains[i]), dtype=torch.bool, device=lm_embedding_chains[i].device)
                 mask[[d[0] for d in discarded_res_ids[chain]]] = 0
                 valid_lm_embeddings.append(lm_embedding_chains[i][mask].detach().cpu())
@@ -939,7 +940,7 @@ class PDBBind(Dataset):
             check_c_alpha_coords = np.array([atom_info['coords'] for atom_info in pocket_atom_info_list if atom_info['is_pocket'] and atom_info['atom_name'] == 'CA'])
             check_n_coords = np.array([atom_info['coords'] for atom_info in pocket_atom_info_list if atom_info['is_pocket'] and atom_info['atom_name'] == 'N'])
             check_c_coords = np.array([atom_info['coords'] for atom_info in pocket_atom_info_list if atom_info['is_pocket'] and atom_info['atom_name'] == 'C'])
-            assert len(rec_coords) == len(check_rec_coords),f"Mismatch in receptor coords. {len(rec_coords)} vs {len(check_rec_coords)}"
+            # assert len(rec_coords) == len(check_rec_coords),f"Mismatch in receptor coords. {len(rec_coords)} vs {len(check_rec_coords)}"
             assert len(c_alpha_coords) == len(check_c_alpha_coords),f"Mismatch in c_alpha coords. {len(c_alpha_coords)} vs {len(check_c_alpha_coords)}"
             assert len(n_coords) == len(check_n_coords),f"Mismatch in n coords. {len(n_coords)} vs {len(check_n_coords)}"
             assert len(c_coords) == len(check_c_coords),f"Mismatch in c coords. {len(c_coords)} vs {len(check_c_coords)}"
@@ -947,28 +948,30 @@ class PDBBind(Dataset):
             lm_embeddings = np.concatenate(valid_lm_embeddings, axis=0)
 
             if lm_embeddings is not None and len(c_alpha_coords) != len(lm_embeddings):
-                raise ValueError(f'LM embeddings for complex {exp_protein_path} did not have the right length for the protein.')
+                raise ValueError(f'LM embeddings for complex {source_pdb} did not have the right length for the protein.')
 
             if not self.knn_only_graph or not self.fixed_knn_radius_graph:
                 raise NotImplementedError('Backwards compatibility has been dropped. We only support knn_only_graph=True and fixed_knn_radius_graph=True.')
 
-            get_rec_graph(receptor, [rec_coords], c_alpha_coords, n_coords, c_coords, misc_coords, misc_features,
+            get_rec_graph(receptor, rec_coords, c_alpha_coords, n_coords, c_coords, misc_coords, misc_features,
                           complex_graph,
                           rec_radius=self.receptor_radius,
                           c_alpha_max_neighbors=self.c_alpha_max_neighbors, all_atoms=self.all_atoms,
                           remove_hs=self.remove_hs, lm_embeddings=lm_embeddings)
+            complex_graph['receptor'].structure = receptor
 
             # select flexible sidechains in receptor
             if self.flexible_sidechains:
                 logging.debug(f"Computing flexible residues within radius {self.flexdist} of binding pocket using {self.flexdist_distance_metric} distance metric")
-
-                xMin, yMin, zMin = flex_coord_min
-                xMax, yMax, zMax = flex_coord_max
+                flexible_residues = set()
+                for atom_info in pocket_atom_info_list:
+                    if atom_info['is_flexible_sidechain']:
+                        flexible_residues.add( (atom_info['chain_id'], atom_info['residue_id']))
 
                 def airdd_prism_distance_metric(atom:Bio.PDB.Atom.Atom):
-                    atom_coord = torch.tensor(atom.coord)
-                    if (xMin <= atom_coord[0] <= xMax) * (yMin <= atom_coord[1] <= yMax) * (zMin <= atom_coord[2] <= zMax):
-                        # check distance to ligand atoms akin to gnina, valid as hydrogens are removed during graph construction
+                    atom_chain_id = atom.parent.parent.id
+                    atom_res_id = atom.parent.id
+                    if (atom_chain_id, atom_res_id) in flexible_residues:
                         return True
                     else: 
                         return False 
@@ -978,12 +981,24 @@ class PDBBind(Dataset):
                 complex_graph = set_sidechain_rotation_masks(complex_graph, receptor, accept_atom_function, remove_hs=self.remove_hs)
 
         except Exception as e:
-            print(f'Skipping {exp_protein_path} because of the error: {e}')
+            print(f'Skipping {source_pdb} because of the error: {e}')
             if not isinstance(e, ProcessingException):
                 print(traceback.format_exc())
             return None, None
 
-        protein_center = torch.mean(complex_graph['receptor'].pos, dim=0, keepdim=True)
+        if self.pocket_reduction:
+            coords_list = []
+            for atom_info in pocket_atom_info_list:
+                if atom_info["atom_name"] == "CA" and atom_info['is_center']:
+                    coords_list.append(atom_info['coords'])
+            if coords_list:
+                pocket_center = torch.tensor(np.array(coords_list))
+                pocket_center = pocket_center.mean(axis=0)
+            else:
+                pocket_center = torch.tensor([0.0,0.0,0.0])
+            protein_center = pocket_center[None, :]
+        else:
+            protein_center = torch.mean(complex_graph['receptor'].pos, dim=0, keepdim=True)
         complex_graph = self.center_complex(complex_graph, protein_center)
 
         return complex_graph, lig

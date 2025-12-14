@@ -60,7 +60,7 @@ def modify_conformer(data, tr_update, rot_update, torsion_updates, pivot=None):
             data['ligand'].pos = rigid_new_pos.to(orig_device)
         return data
     except Exception as e:
-        print("Error in modify_conformer:", e)
+        print("Error in modify_conformer:", e, data["name"])
         return data
 
 def modify_sidechains(data, torsion_updates):

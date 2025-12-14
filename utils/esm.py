@@ -155,8 +155,13 @@ def compute_ESM_embeddings(model, alphabet, labels, sequences, device=None) -> D
 
 @ensure_device
 def esm_embeddings_from_complexes(complex_names, protein_files, device=None) -> List[List[torch.Tensor]]:
-    model_location = "esm2_t33_650M_UR50D"
-    model, alphabet = pretrained.load_model_and_alphabet(model_location)
+    torch_home = os.environ.get('ESM_CACHE_DIR')
+    model_location = os.path.join(torch_home, "esm2_t33_650M_UR50D.pt")
+    if os.path.exists(model_location):
+        model, alphabet = pretrained.load_model_and_alphabet(model_location)
+    else:
+        model_location = "esm2_t33_650M_UR50D"
+        model, alphabet = pretrained.load_model_and_alphabet(model_location)
 
     model.eval()
     if device is not None:

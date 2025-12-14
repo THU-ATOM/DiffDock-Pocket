@@ -502,7 +502,11 @@ def get_lig_graph_with_matching(mol_, complex_graph, popsize, maxiter, matching,
 
     else:  # no matching
         complex_graph.rmsd_matching = 0
-        if remove_hs: mol_ = RemoveHs(mol_)
+        if remove_hs: 
+            try:    
+                mol_ = RemoveHs(mol_, sanitize=True)
+            except:
+                mol_ = RemoveHs(mol_, sanitize=False)
         get_lig_graph(mol_, complex_graph)
 
     edge_mask, mask_rotate = get_transformation_mask(complex_graph)

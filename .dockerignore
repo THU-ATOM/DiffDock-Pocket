@@ -12,3 +12,5 @@ results/*
 # (quite likely they are in the same directory)
 **/pdbbind_sequences.fasta
 **/PDBBind_processed/
+
+*.npy

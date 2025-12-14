@@ -9,6 +9,7 @@ import torch
 
 import yaml
 import math
+import random
 import multiprocessing
 import traceback
 
@@ -104,6 +105,8 @@ def _get_parser():
     parser.add_argument('--temp_psi_sc_tor', type=float,        default=1.339614553802453)
     parser.add_argument('--temp_sigma_data', type=float,        default=0.48884149503636976)
 
+    parser.add_argument('--seed', type=int, default=42, help='Fix random seed for reproducibility')
+
     return parser
 
 
@@ -141,10 +144,14 @@ def infer_single_complex(idx: int, protein_ligand_info_row: Mapping, model: torc
         if os.path.exists(write_dir) and args.skip_existing:
             return 0
 
-        if not args.protein_ligand_airdd_input is not None:
-            # For AIRDD input, we always want to use the processed input structures
-            randomize_position(data_list, score_model_args.no_torsion, args.no_random, score_model_args.tr_sigma_max,
+        # TODO: For AIRDD input, we always want to use the processed input structures
+        randomize_position(data_list, score_model_args.no_torsion, args.no_random, score_model_args.tr_sigma_max,
                             flexible_sidechains=False if args.rigid else score_model_args.flexible_sidechains)
+        
+        # os.makedirs(write_dir, exist_ok=True)
+        # randomized_pkl = os.path.join(write_dir, 'randomized_data_list.pkl')
+        # with open(randomized_pkl, 'wb') as f:
+        #     pickle.dump(data_list, f)
 
         pdb = None
         lig = orig_complex_graph.mol
@@ -207,8 +214,11 @@ def infer_single_complex(idx: int, protein_ligand_info_row: Mapping, model: torc
         atom_pos = np.asarray(
             [complex_graph['atom'].pos.cpu().numpy() + orig_complex_graph.original_center.cpu().numpy() for
              complex_graph in data_list])
-
-        rec_struc = parse_pdb_from_path(protein_ligand_info_row["experimental_protein"])
+        
+        if args.protein_ligand_airdd_input is None:
+            rec_struc = parse_pdb_from_path(protein_ligand_info_row["experimental_protein"])
+        else:
+            rec_struc = parse_pdb_from_path(protein_ligand_info_row["source_pdb"])
         # Similarly as in pdb preprocess, we sort the atoms by the name and put hydrogens at the end
         for res in rec_struc.get_residues():
             res.child_list.sort(key=lambda atom: PDBBind.order_atoms_in_residue(res, atom))
@@ -236,7 +246,10 @@ def infer_single_complex(idx: int, protein_ligand_info_row: Mapping, model: torc
                                   os.path.join(write_dir, f'rank{rank + 1}_confidence{confidence[rank]:.2f}.sdf'))
 
         # if flexibility is enabled, this will be changed to the predicted flexible protein
-        protein_path = protein_ligand_info_row['experimental_protein']
+        if args.protein_ligand_airdd_input is None:
+            protein_path = protein_ligand_info_row['experimental_protein']
+        else:
+            protein_path = protein_ligand_info_row['source_pdb']
         if not args.rigid and score_model_args.flexible_sidechains:
             for rank, pos in enumerate(atom_pos):
                 out = SidechainPDBFile(copy.deepcopy(rec_struc), data_list[rank]['flexResidues'], [atom_pos[rank]])
@@ -310,7 +323,17 @@ def infer_multiple_complexes(protein_ligand_df, *args, **kwargs):
     return count_succeeded
 
 
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
 def main(args):
+    seed_everything(args.seed)
+    
     if args.config:
         config_dict = yaml.load(args.config, Loader=yaml.FullLoader)
         arg_dict = args.__dict__
@@ -337,7 +360,6 @@ def main(args):
 
     if not os.path.exists(f'{args.model_dir}/model_parameters.yml') or not os.path.exists(f'{args.filtering_model_dir}/model_parameters.yml'):
         checkpointdir = os.path.dirname(args.model_dir)
-        print("DEBUG: check pointdir", checkpointdir, os.path.exists(checkpointdir))
         """ensure checkpoint exist or download from github releases"""
         tag = "v1.0.0"
         base_url = f"https://github.com/plainerman/DiffDock-Pocket/releases/download/{tag}"
@@ -527,11 +549,12 @@ def main(args):
 
 
 if __name__ == "__main__":
-    mp_method = "spawn"
-    sharing_strategy = "file_system"
-    logging.debug(f"Torch multiprocessing method: {mp_method}. Sharing strategy: {sharing_strategy}")
-    torch.multiprocessing.set_start_method(mp_method)
-    torch.multiprocessing.set_sharing_strategy(sharing_strategy)
+    # TODO: for multiprocessing
+    # mp_method = "spawn"
+    # sharing_strategy = "file_system"
+    # logging.debug(f"Torch multiprocessing method: {mp_method}. Sharing strategy: {sharing_strategy}")
+    # torch.multiprocessing.set_start_method(mp_method)
+    # torch.multiprocessing.set_sharing_strategy(sharing_strategy)
 
     parser = _get_parser()
     _args = parser.parse_args()
